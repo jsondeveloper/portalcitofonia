@@ -1,13 +1,16 @@
-import React, { useState } from 'react';
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Login from './Login';
 import Dashboard from './Dashboard';
 
 function App() {
-  const [token, setToken] = useState(null);
   return (
-    <div>
-      {token ? <Dashboard token={token} /> : <Login setToken={setToken} />}
-    </div>
+    <Router>
+      <Routes>
+        <Route path="/" element={<Login />} />
+        <Route path="/dashboard" element={<Dashboard />} />
+      </Routes>
+    </Router>
   );
 }
 

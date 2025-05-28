@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import jwt_decode from 'jwt-decode';
+import { jwtDecode } from 'jwt-decode';
 
 function Dashboard() {
   const [buddies, setBuddies] = useState([]);
@@ -9,7 +9,7 @@ function Dashboard() {
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) return window.location.href = '/';
-    const decoded = jwt_decode(token);
+    const decoded = jwtDecode(token);
     setUser(decoded);
 
     axios.get('http://localhost:3001/api/sip_buddies', {

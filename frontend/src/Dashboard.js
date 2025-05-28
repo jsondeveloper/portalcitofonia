@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { getExtensions, createExtension, updateExtension, deleteExtension } from './api';
-import jwt_decode from 'jwt-decode';
+import { jwtDecode } from 'jwt-decode';
+
 
 function Dashboard({ token }) {
   const [extensions, setExtensions] = useState([]);
   const [form, setForm] = useState({ name: '', secret: '', context: '' });
-  const user = jwt_decode(token);
+  const user = jwtDecode(token);
+
 
   const fetchData = async () => {
     const data = await getExtensions(token);

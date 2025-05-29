@@ -1,63 +1,135 @@
+const { Client } = require('ssh2');
 const fs = require('fs');
-const path = require('path');
-const db = require('../config/db');
+const os = require('os');
+const mysql = require('mysql2/promise');
 
-const confPath = path.join(__dirname, '../routes/extensions.js');
-const backupDir = path.join(__dirname, '../../conf/backups');
+async function readRemoteFile({ host, username, privateKeyPath, remotePath }) {
+    return new Promise((resolve, reject) => {
+        const conn = new Client();
+        const privateKey = fs.readFileSync(privateKeyPath, 'utf8');
 
-function parseConfFile() {
-  const lines = fs.readFileSync(confPath, 'utf-8').split('\n');
-  let context = '';
-  const data = [];
+        conn
+            .on('ready', () => {
+                conn.sftp((err, sftp) => {
+                    if (err) {
+                        conn.end();
+                        return reject(err);
+                    }
 
-  for (let line of lines) {
-    line = line.trim();
-    if (line.startsWith('[')) {
-      context = line.replace(/\[|\]/g, '');
-    } else if (line.startsWith('exten')) {
-      const match = /exten\s*=>\s*(\d+),(\w+),dial\(sip\/comunitel\/(\d+),\d+,(A\([^)]+\))\)/i.exec(line);
-      if (match) {
-        const [, ext, prio, number, opt] = match;
-        data.push([ext, prio, number, opt, context]);
-      }
-    }
-  }
-  return data;
-}
+                    let chunks = [];
+                    const stream = sftp.createReadStream(remotePath);
 
-async function writeConfFile() {
-  const [rows] = await db.query('SELECT * FROM extensions ORDER BY context, extension_number, priority');
-  const grouped = {};
-
-  for (let row of rows) {
-    const ctx = row.context;
-    if (!grouped[ctx]) grouped[ctx] = [];
-    grouped[ctx].push(`exten => ${row.extension_number},${row.priority},dial(sip/comunitel/${row.destination_number},25,${row.options})`);
-  }
-
-  const content = Object.entries(grouped).map(
-    ([ctx, lines]) => `[${ctx}]\n${lines.join('\n')}`
-  ).join('\n\n');
-
-  fs.writeFileSync(confPath, content, 'utf-8');
-}
-
-async function backupConf() {
-  const date = new Date().toISOString().replace(/[:.]/g, '-');
-  if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir);
-  const backupPath = path.join(backupDir, `extensions-${date}.conf`);
-  fs.copyFileSync(confPath, backupPath);
+                    stream.on('data', chunk => chunks.push(chunk));
+                    stream.on('end', () => {
+                        const content = Buffer.concat(chunks).toString('utf8');
+                        conn.end();
+                        resolve(content);
+                    });
+                    stream.on('error', err => {
+                        conn.end();
+                        reject(err);
+                    });
+                });
+            })
+            .connect({
+                host,
+                username,
+                privateKey,
+            });
+    });
 }
 
 async function syncFromFile() {
-  const parsed = parseConfFile();
-  await db.execute('DELETE FROM extensions');
-  if (parsed.length > 0) {
-    await db.query(
-      'INSERT INTO extensions (extension_number, priority, destination_number, options, context) VALUES ?',
-      [parsed]
-    );
-  }
+    const host = process.env.SSH_HOST;
+    const username = process.env.SSH_USER;
+    const privateKeyPath = process.env.SSH_KEY_PATH.replace('~', os.homedir());
+    const remotePath = '/etc/asterisk/extensions.conf';
+
+    const dbConfig = {
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASS,
+        database: process.env.DB_NAME,
+    };
+
+    const content = await readRemoteFile({ host, username, privateKeyPath, remotePath });
+
+    console.log('📄 Archivo extensions.conf:\n', content);
+
+    const lines = content.split('\n').map(line => line.trim());
+    const config = {};
+    let currentContext = null;
+    const allowedContexts = ['salitreclub', 'poloclub'];
+
+    // Paso 1: Agrupar líneas por contexto
+    for (const line of lines) {
+        if (!line || line.startsWith(';')) continue;
+
+        if (line.startsWith('[') && line.endsWith(']')) {
+            currentContext = line.slice(1, -1);
+        } else if (currentContext && allowedContexts.includes(currentContext)) {
+            if (!config[currentContext]) config[currentContext] = [];
+            config[currentContext].push(line);
+        }
+    }
+
+    const connection = await mysql.createConnection(dbConfig);
+
+    try {
+        await connection.query('DELETE FROM asterisk_extensions');
+
+        // Paso 2: Procesar cada contexto por separado
+        for (const [context, lines] of Object.entries(config)) {
+            const extensionMap = {};
+
+            for (const line of lines) {
+                const match = line.match(/^exten\s*=>\s*(\d+),(\d+|n),dial\(\s*([^)]+)\)/i);
+                if (match) {
+                    const ext = match[1];
+                    const dialContent = match[3]; // ahora está en la posición 3
+
+                    const firstCommaIndex = dialContent.indexOf(',');
+                    const channel = firstCommaIndex === -1 ? dialContent.trim() : dialContent.substring(0, firstCommaIndex).trim();
+
+                    const parts = channel.split('/').filter(Boolean);
+                    const number = parts.length > 0 ? parts[parts.length - 1] : null;
+
+                    if (number) {
+                        if (!extensionMap[ext]) extensionMap[ext] = [];
+                        if (extensionMap[ext].length < 5) {
+                            extensionMap[ext].push(number);
+                        }
+                    }
+                }
+            }
+
+
+
+
+            for (const [ext, numbers] of Object.entries(extensionMap)) {
+                const padded = [...numbers, ...Array(5 - numbers.length).fill('0')];
+                console.log(`📥 Insertando: ${context} - ${ext} - ${padded.join(', ')}`);
+
+                await connection.query(
+                    `INSERT INTO asterisk_extensions (
+                context, extension, posicion1, posicion2, posicion3, posicion4, posicion5
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [context, ext, ...padded]
+                );
+            }
+        }
+
+
+
+        console.log('✅ Extensiones sincronizadas correctamente');
+    } catch (err) {
+        console.error('❌ Error guardando en DB:', err);
+    } finally {
+        await connection.end();
+    }
 }
 
-module.exports = { parseConfFile, writeConfFile, backupConf, syncFromFile };
+
+module.exports = {
+    syncFromFile,
+};
